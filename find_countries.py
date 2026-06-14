@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
-from dbparse import DBParser, flag_definitions
+from dbparse import DBParser, dfs_regions, flag_definitions
 
 
 IMPLEMENTED_BANDS = ('2.4', '5')
@@ -14,8 +15,13 @@ CHANNEL_LIMITS = {
     '2.4': (1, 14),
     '5': (32, 181),
 }
-REQUIREMENT_KEYS = ('band', 'channels', 'min-bw', 'flag-inc', 'flag-exc')
-SINGULAR_REQUIREMENT_KEYS = ('band', 'channels', 'min-bw')
+REQUIREMENT_KEYS = (
+    'band', 'channels', 'min-bw', 'min-eirp', 'flag-inc', 'flag-exc'
+)
+REQUIRED_REQUIREMENT_KEYS = ('band', 'channels')
+SINGULAR_REQUIREMENT_KEYS = ('band', 'channels', 'min-bw', 'min-eirp')
+DFS_REGION_NAMES = dict((value, key) for key, value in dfs_regions.items())
+WMMRULE_ETSI_FLAG = 'wmmrule=ETSI'
 
 
 class Requirement(object):
@@ -24,6 +30,7 @@ class Requirement(object):
         band,
         channels,
         min_bw,
+        min_eirp,
         flag_inc,
         flag_exc,
         query_start_mhz,
@@ -32,6 +39,7 @@ class Requirement(object):
         self.band = band
         self.channels = channels
         self.min_bw = min_bw
+        self.min_eirp = min_eirp
         self.flag_inc = flag_inc
         self.flag_exc = flag_exc
         self.query_start_mhz = query_start_mhz
@@ -94,6 +102,14 @@ def parse_non_negative_float(value):
     return result
 
 
+def parse_power_value(value):
+    try:
+        result = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('expected a numeric power value')
+    return result
+
+
 def parse_requirement(value):
     fields = {}
     flag_inc = []
@@ -131,7 +147,7 @@ def parse_requirement(value):
             flag_exc.append(parse_flag(item_value, key))
 
     missing_keys = [
-        key for key in SINGULAR_REQUIREMENT_KEYS
+        key for key in REQUIRED_REQUIREMENT_KEYS
         if key not in fields
     ]
     if missing_keys:
@@ -151,7 +167,8 @@ def parse_requirement(value):
 
     channels = parse_requirement_channels(fields['channels'])
     validate_requirement_channels(band, channels)
-    min_bw = parse_requirement_min_bw(fields['min-bw'])
+    min_bw = parse_requirement_min_bw(fields.get('min-bw'))
+    min_eirp = parse_requirement_min_eirp(fields.get('min-eirp'))
     validate_requirement_flags(flag_inc, flag_exc)
 
     start_channel, end_channel = channels
@@ -159,6 +176,7 @@ def parse_requirement(value):
         band,
         channels,
         min_bw,
+        min_eirp,
         flag_inc,
         flag_exc,
         channel_to_mhz(band, start_channel),
@@ -167,15 +185,17 @@ def parse_requirement(value):
 
 
 def parse_flag(value, key):
-    if value not in flag_definitions:
-        raise argparse.ArgumentTypeError(
-            "invalid %s flag %r (choose from %s)" % (
-                key,
-                value,
-                ', '.join(sorted(flag_definitions)),
-            )
+    if value in flag_definitions or value == WMMRULE_ETSI_FLAG:
+        return value
+
+    valid_flags = sorted(list(flag_definitions) + [WMMRULE_ETSI_FLAG])
+    raise argparse.ArgumentTypeError(
+        "invalid %s flag %r (choose from %s)" % (
+            key,
+            value,
+            ', '.join(valid_flags),
         )
-    return value
+    )
 
 
 def parse_requirement_channels(value):
@@ -186,10 +206,80 @@ def parse_requirement_channels(value):
 
 
 def parse_requirement_min_bw(value):
+    if value is None:
+        return None
     try:
-        return parse_non_negative_float(value)
+        min_bw = parse_non_negative_float(value)
     except argparse.ArgumentTypeError as exc:
         raise argparse.ArgumentTypeError('invalid min-bw: %s' % exc)
+    if min_bw == 0:
+        return None
+    return min_bw
+
+
+def parse_requirement_min_eirp(value):
+    if value is None:
+        return None
+
+    normalized = value.strip().lower()
+    if normalized.endswith('dbm'):
+        return parse_min_eirp_dbm(value.strip()[:-3].strip())
+
+    if normalized.endswith('mw'):
+        return parse_min_eirp_mw(value.strip()[:-2].strip())
+
+    raise argparse.ArgumentTypeError(
+        'invalid min-eirp: expected VALUEdBm or VALUEmW'
+    )
+
+
+def parse_min_eirp_dbm(value):
+    try:
+        min_eirp = parse_power_value(value)
+    except argparse.ArgumentTypeError as exc:
+        raise argparse.ArgumentTypeError('invalid min-eirp: %s' % exc)
+
+    if math.isnan(min_eirp):
+        raise argparse.ArgumentTypeError('invalid min-eirp: NaN is not valid')
+    if math.isinf(min_eirp) and min_eirp > 0:
+        raise argparse.ArgumentTypeError(
+            'invalid min-eirp: +inf dBm is not valid'
+        )
+    return min_eirp
+
+
+def parse_min_eirp_mw(value):
+    try:
+        min_mw = parse_power_value(value)
+    except argparse.ArgumentTypeError as exc:
+        raise argparse.ArgumentTypeError('invalid min-eirp: %s' % exc)
+
+    if math.isnan(min_mw):
+        raise argparse.ArgumentTypeError('invalid min-eirp: NaN is not valid')
+    if math.isinf(min_mw):
+        raise argparse.ArgumentTypeError(
+            'invalid min-eirp: infinite mW is not valid'
+        )
+    if min_mw < 0:
+        raise argparse.ArgumentTypeError(
+            'invalid min-eirp: mW value must be greater than or equal to 0'
+        )
+    if min_mw == 0:
+        return float('-inf')
+    return 10.0 * math.log10(min_mw)
+
+
+def parse_country_code(value):
+    country_code = value.strip().upper()
+    if len(country_code) != 2:
+        raise argparse.ArgumentTypeError(
+            'country code must be exactly two characters'
+        )
+    try:
+        country_code.encode('ascii')
+    except UnicodeEncodeError:
+        raise argparse.ArgumentTypeError('country code must be ASCII')
+    return country_code
 
 
 def validate_requirement_channels(band, channels):
@@ -224,24 +314,30 @@ def parse_args(argv):
         default=str(Path(__file__).resolve().with_name('db.txt')),
         help='path to db.txt (default: db.txt next to this script)',
     )
-    parser.add_argument(
+    query_group = parser.add_mutually_exclusive_group(required=True)
+    query_group.add_argument(
         '--require',
-        required=True,
         action='append',
         type=parse_requirement,
         metavar='KEY=VALUE,...',
         help=(
             'required condition group; repeat for AND. Required keys: '
-            'band, channels, min-bw. Optional repeatable keys: '
-            'flag-inc, flag-exc'
+            'band, channels. Optional keys: min-bw, min-eirp. '
+            'Optional repeatable keys: flag-inc, flag-exc'
         ),
+    )
+    query_group.add_argument(
+        '--country',
+        type=parse_country_code,
+        metavar='COUNTRY',
+        help='print all rules for one country code, for example US',
     )
     return parser.parse_args(argv)
 
 
 def load_countries(db_path):
     with open(db_path, 'r', encoding='utf-8') as db_file:
-        return DBParser().parse(db_file)
+        return DBParser(include_no_indoor=True).parse(db_file)
 
 
 def fully_covers(rule_start, rule_end, query_start, query_end):
@@ -257,7 +353,12 @@ def matching_permissions(
     matches = []
     for permission in country.permissions:
         band = permission.freqband
-        if band.maxbw < requirement.min_bw:
+        if requirement.min_bw is not None and band.maxbw < requirement.min_bw:
+            continue
+        if (
+            requirement.min_eirp is not None
+            and permission.power.max_eirp < requirement.min_eirp
+        ):
             continue
         if not fully_covers(
             band.start,
@@ -266,22 +367,108 @@ def matching_permissions(
             requirement.query_end_mhz,
         ):
             continue
-        if not included_flags.issubset(permission.textflags):
+        if not permission_has_all_flags(permission, included_flags):
             continue
-        if excluded_flags.intersection(permission.textflags):
+        if permission_has_any_flag(permission, excluded_flags):
             continue
         matches.append(permission)
     return matches
+
+
+def permission_has_all_flags(permission, flags):
+    return all(permission_has_flag(permission, flag) for flag in flags)
+
+
+def permission_has_any_flag(permission, flags):
+    return any(permission_has_flag(permission, flag) for flag in flags)
+
+
+def permission_has_flag(permission, flag):
+    if flag == WMMRULE_ETSI_FLAG:
+        return permission.wmmrule is not None
+    return flag in permission.textflags
 
 
 def format_mhz(value):
     return '%g' % value
 
 
-def format_eirp(power):
-    if power.max_eirp:
-        return '%.2f dBm' % power.max_eirp
+def format_band(band):
+    if band == 's1g':
+        return 'S1G'
+    if band == 'unknown':
+        return 'unknown'
+    return '%s GHz' % band
+
+
+def format_channel_ranges(channels):
+    if channels is None:
+        return 'unsupported'
+    if not channels:
+        return 'none'
+
+    ranges = []
+    start = channels[0]
+    end = channels[0]
+    for channel in channels[1:]:
+        if channel == end + 1:
+            end = channel
+            continue
+        ranges.append(format_channel_range(start, end))
+        start = channel
+        end = channel
+    ranges.append(format_channel_range(start, end))
+    return ','.join(ranges)
+
+
+def format_channel_range(start, end):
+    if start == end:
+        return '%d' % start
+    return '%d-%d' % (start, end)
+
+
+def rule_channels(band, freqband):
+    if band not in CHANNEL_LIMITS:
+        return None
+
+    min_channel, max_channel = CHANNEL_LIMITS[band]
+    channels = []
+    for channel in range(min_channel, max_channel + 1):
+        mhz = channel_to_mhz(band, channel)
+        if freqband.start <= mhz <= freqband.end:
+            channels.append(channel)
+    return channels
+
+
+def source_eirp_is_na(permission):
+    source_eirp = permission.source_eirp
+    return source_eirp is not None and source_eirp.upper() == 'N/A'
+
+
+def format_eirp_dbm(permission):
+    if source_eirp_is_na(permission):
+        return 'N/A'
+    if permission.power.max_eirp is not None:
+        return '%.2f dBm' % permission.power.max_eirp
     return 'N/A'
+
+
+def format_power_mw(permission):
+    if source_eirp_is_na(permission):
+        return 'N/A'
+    source_eirp = permission.source_eirp
+    if source_eirp and source_eirp.lower().endswith('mw'):
+        return '%s mW' % source_eirp[:-2]
+    if permission.power.max_eirp is not None:
+        return '%.2f mW' % (10.0 ** (permission.power.max_eirp / 10.0))
+    return 'N/A'
+
+
+def permission_flags(permission):
+    flags = list(permission.textflags)
+    if permission.wmmrule is not None:
+        flags.append(WMMRULE_ETSI_FLAG)
+    return flags
 
 
 def format_flags(flags):
@@ -290,18 +477,42 @@ def format_flags(flags):
     return 'none'
 
 
+def format_dfs_region(dfs_region):
+    return DFS_REGION_NAMES.get(dfs_region, 'DFS-UNSET')
+
+
+def infer_rule_band(freqband):
+    if freqband.end <= 1000:
+        return 's1g'
+    if freqband.start < 2500 and freqband.end <= 2500:
+        return '2.4'
+    if freqband.start < 5925:
+        return '5'
+    if freqband.start < 10000:
+        return '6'
+    if freqband.start >= 57000:
+        return '60'
+    return 'unknown'
+
+
 def print_matches(matches):
-    for country_code, permissions in matches:
-        print(country_code)
-        for permission in permissions:
-            band = permission.freqband
+    for country_code, dfs_region, entries in matches:
+        print('%s, %s' % (country_code, format_dfs_region(dfs_region)))
+        for requirement_band, permission in entries:
+            freqband = permission.freqband
             print(
-                '  %s-%s MHz @ %s MHz, EIRP %s, flags %s' % (
-                    format_mhz(band.start),
-                    format_mhz(band.end),
-                    format_mhz(band.maxbw),
-                    format_eirp(permission.power),
-                    format_flags(permission.textflags),
+                '  band %s, channels %s, %s-%s MHz @ %s MHz, '
+                'EIRP %s, power %s, flags %s' % (
+                    format_band(requirement_band),
+                    format_channel_ranges(
+                        rule_channels(requirement_band, freqband)
+                    ),
+                    format_mhz(freqband.start),
+                    format_mhz(freqband.end),
+                    format_mhz(freqband.maxbw),
+                    format_eirp_dbm(permission),
+                    format_power_mw(permission),
+                    format_flags(permission_flags(permission)),
                 )
             )
 
@@ -316,10 +527,27 @@ def main(argv=None):
         return 1
 
     matches = []
-    for raw_code, country in sorted(countries.items()):
-        permissions = matching_country_permissions(country, args.require)
-        if permissions:
-            matches.append((raw_code.decode('ascii'), permissions))
+    if args.country:
+        raw_code = args.country.encode('ascii')
+        country = countries.get(raw_code)
+        if country is None:
+            print('error: country %s not found' % args.country, file=sys.stderr)
+            return 1
+        matches.append((
+            args.country,
+            country.dfs_region,
+            country_permissions(country),
+        ))
+    else:
+        for raw_code, country in sorted(countries.items()):
+            permissions = matching_country_permissions(country, args.require)
+            if not permissions:
+                continue
+            matches.append((
+                raw_code.decode('ascii'),
+                country.dfs_region,
+                permissions,
+            ))
 
     if not matches:
         print('No matching countries.')
@@ -327,6 +555,13 @@ def main(argv=None):
 
     print_matches(matches)
     return 0
+
+
+def country_permissions(country):
+    return [
+        (infer_rule_band(permission.freqband), permission)
+        for permission in country.permissions
+    ]
 
 
 def matching_country_permissions(country, requirements):
@@ -340,7 +575,7 @@ def matching_country_permissions(country, requirements):
             if permission in seen_permissions:
                 continue
             seen_permissions.add(permission)
-            country_matches.append(permission)
+            country_matches.append((requirement.band, permission))
     return country_matches
 
 

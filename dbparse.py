@@ -126,20 +126,22 @@ class IgnoreRule(Exception):
 
 @total_ordering
 class Permission(object):
-    def __init__(self, freqband, power, flags, wmmrule):
+    def __init__(self, freqband, power, flags, wmmrule,
+                 source_eirp=None, include_no_indoor=False):
         assert isinstance(freqband, FreqBand)
         assert isinstance(power, PowerRestriction)
         assert isinstance(wmmrule, WmmRule) or wmmrule is None
         self.freqband = freqband
         self.power = power
         self.wmmrule = wmmrule
+        self.source_eirp = source_eirp
         self.flags = 0
         for flag in flags:
             if not flag in flag_definitions:
                 raise FlagError(flag)
             self.flags |= flag_definitions[flag]
         # ignore rule with NO-INDOOR as the kernel doesn't support it yet.
-        if 'NO-INDOOR' in flags:
+        if 'NO-INDOOR' in flags and not include_no_indoor:
             raise IgnoreRule()
         self.textflags = flags
 
@@ -193,8 +195,9 @@ class SyntaxError(Exception):
     pass
 
 class DBParser(object):
-    def __init__(self, warn=None):
+    def __init__(self, warn=None, include_no_indoor=False):
         self._warn_callout = warn or sys.stderr.write
+        self._include_no_indoor = include_no_indoor
 
     def _syntax_error(self, txt=None):
         txt = txt and ' (%s)' % txt or ''
@@ -270,6 +273,7 @@ class DBParser(object):
 
     def _parse_power_def(self, pname, line, dupwarn=True):
         try:
+            source_eirp = line
             max_eirp = line
             if max_eirp == 'N/A':
                 max_eirp = '0'
@@ -296,6 +300,7 @@ class DBParser(object):
         self._power[pname] = p
         self._powerrev[p] = pname
         self._powerline[pname] = self._lineno
+        self._power_source_eirp[pname] = source_eirp
 
     def _parse_wmmrule(self, line):
         regions = line[:-1].strip()
@@ -406,10 +411,12 @@ class DBParser(object):
             power = pname[1:]
             pname = 'UNNAMED %d' % self._lineno
             self._parse_power_def(pname, power, dupwarn=False)
+            source_eirp = power
         else:
             line = line.split(',')
             pname = line[0]
             flags = line[1:]
+            source_eirp = self._power_source_eirp.get(pname)
         w = None
         if flags and 'wmmrule' in flags[-1]:
             try:
@@ -432,7 +439,11 @@ class DBParser(object):
         b = self._bands[bname]
         p = self._power[pname]
         try:
-            perm = Permission(b, p, flags, w)
+            perm = Permission(
+                b, p, flags, w,
+                source_eirp=source_eirp,
+                include_no_indoor=self._include_no_indoor,
+            )
         except FlagError as e:
             self._syntax_error("Invalid flag '%s'" % e.flag)
         except IgnoreRule:
@@ -458,6 +469,7 @@ class DBParser(object):
         self._powerdup = {}
         self._bandline = {}
         self._powerline = {}
+        self._power_source_eirp = {}
         self._wmm_rules = defaultdict(lambda: OrderedDict())
 
         self._comments = []
